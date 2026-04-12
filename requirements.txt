@@ -1,0 +1,15 @@
+# Email parsing
+extract-msg>=0.28.0      # .msg (Outlook) files
+striprtf>=0.0.26         # RTF-to-text fallback for RTF-only MSG files
+
+# PDF rendering — choose one (or install both)
+playwright>=1.40.0       # Chromium-based, best formatting fidelity (recommended)
+                         # After install: playwright install chromium
+weasyprint>=61.0         # Pure-Python alternative, no browser needed
+
+# HTML preprocessing
+css-inline>=0.14.0       # Rust-backed CSS inliner (~10x faster than premailer)
+
+# PDF post-processing
+pikepdf>=8.0.0           # Pure-Python XMP metadata injection into PDFs
+                         # Optional: install Ghostscript for --pdfa PDF/A-2b conversion
