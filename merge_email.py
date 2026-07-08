@@ -42,34 +42,38 @@ Conversion support
 Usage:
     python merge_email.py                         # uses output/ next to script
     python merge_email.py path/to/output_dir/     # explicit path
+    python merge_email.py path/to/output_dir/ --force
 """
 
 import sys
+import argparse
 import shutil
 import tempfile
 import subprocess
 import traceback
 import zipfile
 import re as _re
+import stat
+import time
 from datetime import datetime
 from html import escape
 from pathlib import Path
+
+from resource_limits import (
+    DEFAULT_LIMITS,
+    ResourceLimits,
+    check_bytes_size,
+    check_count,
+    check_file_size,
+    check_text_size,
+    run_with_timeout,
+)
 
 # UTF-8 console output — prevents crashes on non-Latin subjects/paths (Windows CP1252)
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-
-# ---------------------------------------------------------------------------
-# Dependency check
-# ---------------------------------------------------------------------------
-
-try:
-    import pikepdf
-except ImportError:
-    sys.exit("pikepdf is required: pip install pikepdf")
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +88,6 @@ HTML_EXTS         = {".html", ".htm"}
 EMAIL_EXTS        = {".eml", ".msg"}
 ARCHIVE_EXTS      = {".zip", ".rar"}
 
-_ARCHIVE_MAX_DEPTH        = 3                  # maximum nesting depth for archives-within-archives
-_ARCHIVE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MB uncompressed size guard
-
 # Common Windows locations for the UnRAR binary (tried in order if not in PATH)
 _UNRAR_SEARCH_PATHS = [
     r"C:\Program Files\WinRAR\UnRAR.exe",
@@ -99,7 +100,11 @@ _UNRAR_SEARCH_PATHS = [
 # Individual converters
 # ---------------------------------------------------------------------------
 
-def _libreoffice_to_pdf(src: Path, out_dir: Path) -> Path:
+def _libreoffice_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
     """Convert any LibreOffice-compatible file to PDF via headless LibreOffice."""
     for exe in ("soffice", "libreoffice"):
         if shutil.which(exe):
@@ -111,6 +116,7 @@ def _libreoffice_to_pdf(src: Path, out_dir: Path) -> Path:
     result = subprocess.run(
         [exe, "--headless", "--convert-to", "pdf", "--outdir", str(out_dir), str(src)],
         capture_output=True, text=True,
+        timeout=limits.timeout(limits.timeout_libreoffice_seconds),
     )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice exited {result.returncode}: {result.stderr.strip()}")
@@ -120,7 +126,7 @@ def _libreoffice_to_pdf(src: Path, out_dir: Path) -> Path:
     return pdf
 
 
-def _docx2pdf_to_pdf(src: Path, out_dir: Path) -> Path:
+def _docx2pdf_to_pdf_impl(src: Path, out_dir: Path) -> Path:
     """Convert a Word-compatible file to PDF via docx2pdf (uses Word on Windows).
 
     Retries once after a short delay — Word COM can disconnect mid-session when
@@ -151,7 +157,21 @@ def _docx2pdf_to_pdf(src: Path, out_dir: Path) -> Path:
     raise RuntimeError(f"docx2pdf failed after retry: {last_exc or 'no output produced'}")
 
 
-def _image_to_pdf(src: Path, out_dir: Path) -> Path:
+def _docx2pdf_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    return run_with_timeout(
+        _docx2pdf_to_pdf_impl,
+        limits.timeout(limits.timeout_docx2pdf_seconds),
+        f"docx2pdf conversion for {src.name}",
+        src,
+        out_dir,
+    )
+
+
+def _image_to_pdf_impl(src: Path, out_dir: Path) -> Path:
     """Convert an image to PDF via img2pdf (lossless, preserves DPI)."""
     try:
         import img2pdf
@@ -163,8 +183,28 @@ def _image_to_pdf(src: Path, out_dir: Path) -> Path:
     return out
 
 
-def _playwright_html_to_pdf(html: str, out: Path) -> None:
+def _image_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    check_file_size(src, limits.max_single_attachment_bytes, src.name, limits)
+    return run_with_timeout(
+        _image_to_pdf_impl,
+        limits.timeout(limits.timeout_image_seconds),
+        f"image conversion for {src.name}",
+        src,
+        out_dir,
+    )
+
+
+def _playwright_html_to_pdf(
+    html: str,
+    out: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> None:
     """Render an HTML string to PDF via Playwright (headless Chromium)."""
+    check_text_size(html, limits.max_generated_html_bytes, "attachment HTML", limits)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -174,14 +214,20 @@ def _playwright_html_to_pdf(html: str, out: Path) -> None:
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page()
+        timeout_ms = limits.timeout(limits.timeout_html_attachment_seconds)
+        if timeout_ms is not None:
+            page.set_default_timeout(timeout_ms * 1000)
+            page.set_default_navigation_timeout(timeout_ms * 1000)
         page.route("**/*", lambda route: route.abort())
         page.set_content(html, wait_until="domcontentloaded")
         page.pdf(path=str(out), print_background=True)
         browser.close()
 
 
-def _text_to_pdf(src: Path, out_dir: Path) -> Path:
+def _text_to_pdf_impl(src: Path, out_dir: Path, force: bool) -> Path:
     """Render a plain-text or CSV file to PDF via Playwright."""
+    limits = ResourceLimits(force=force)
+    check_file_size(src, limits.max_text_attachment_bytes, src.name, limits)
     text = src.read_text(encoding="utf-8", errors="replace")
     html = (
         "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
@@ -189,34 +235,85 @@ def _text_to_pdf(src: Path, out_dir: Path) -> Path:
         "white-space:pre-wrap;word-wrap:break-word;margin:24px}</style>"
         f"</head><body>{escape(text)}</body></html>"
     )
+    check_text_size(html, limits.max_generated_html_bytes, "text attachment HTML", limits)
     out = out_dir / f"{src.stem}.pdf"
-    _playwright_html_to_pdf(html, out)
+    _playwright_html_to_pdf(html, out, limits=limits)
     return out
 
 
-def _html_file_to_pdf(src: Path, out_dir: Path) -> Path:
+def _text_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    return run_with_timeout(
+        _text_to_pdf_impl,
+        limits.timeout(limits.timeout_html_attachment_seconds),
+        f"text render for {src.name}",
+        src,
+        out_dir,
+        limits.force,
+    )
+
+
+def _html_file_to_pdf_impl(src: Path, out_dir: Path, force: bool) -> Path:
     """Render an HTML file to PDF via Playwright."""
+    limits = ResourceLimits(force=force)
+    check_file_size(src, limits.max_generated_html_bytes, src.name, limits)
     html = src.read_text(encoding="utf-8", errors="replace")
+    check_text_size(html, limits.max_generated_html_bytes, "HTML attachment", limits)
     out = out_dir / f"{src.stem}.pdf"
-    _playwright_html_to_pdf(html, out)
+    _playwright_html_to_pdf(html, out, limits=limits)
     return out
 
 
-def _email_to_pdf(src: Path, out_dir: Path) -> Path:
+def _html_file_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    return run_with_timeout(
+        _html_file_to_pdf_impl,
+        limits.timeout(limits.timeout_html_attachment_seconds),
+        f"HTML render for {src.name}",
+        src,
+        out_dir,
+        limits.force,
+    )
+
+
+def _email_to_pdf_impl(src: Path, out_dir: Path, force: bool) -> Path:
     """Convert an embedded .eml/.msg file to PDF using the emailtopdf pipeline."""
+    limits = ResourceLimits(force=force)
     script_dir = Path(__file__).parent
     if str(script_dir) not in sys.path:
         sys.path.insert(0, str(script_dir))
     import emailtopdf as etp
 
     parse_fn = etp.parse_eml if src.suffix.lower() == ".eml" else etp.parse_msg
-    data     = parse_fn(src)
-    html     = etp.build_html(data)
+    data     = parse_fn(src, limits=limits)
+    html     = etp.build_html(data, limits=limits)
     html     = etp._inline_css(html)
+    check_text_size(html, limits.max_generated_html_bytes, "embedded email HTML", limits)
     out      = out_dir / f"{src.stem}.pdf"
     with etp.PlaywrightPool() as pool:
-        pool.render_pdf(html, out)
+        pool.render_pdf(html, out, limits=limits)
     return out
+
+
+def _email_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    return run_with_timeout(
+        _email_to_pdf_impl,
+        limits.timeout(limits.timeout_email_seconds),
+        f"embedded email conversion for {src.name}",
+        src,
+        out_dir,
+        limits.force,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +381,42 @@ def _sniff_extension(src: Path) -> str:
 # Dispatcher
 # ---------------------------------------------------------------------------
 
-def convert_to_pdf(src: Path, out_dir: Path) -> Path:
+def _pdf_page_count_impl(src: Path) -> int:
+    import pikepdf
+
+    with pikepdf.Pdf.open(src) as pdf:
+        return len(pdf.pages)
+
+
+def _check_pdf_page_budget(
+    src: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> None:
+    if not limits.enabled():
+        return
+    pages = run_with_timeout(
+        _pdf_page_count_impl,
+        limits.timeout(limits.timeout_pdf_seconds),
+        f"PDF page count for {src.name}",
+        src,
+    )
+    check_count(pages, limits.max_pdf_pages_per_attachment, f"PDF page count for {src.name}", limits)
+
+
+def _checked_pdf(
+    src: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
+    check_file_size(src, limits.max_single_attachment_bytes, src.name, limits)
+    _check_pdf_page_budget(src, limits)
+    return src
+
+
+def convert_to_pdf(
+    src: Path,
+    out_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> Path:
     """
     Convert src to a PDF placed in out_dir.
     Returns the path to the produced PDF.
@@ -292,6 +424,7 @@ def convert_to_pdf(src: Path, out_dir: Path) -> Path:
     Raises ValueError for unsupported file types.
     """
     ext = src.suffix.lower()
+    check_file_size(src, limits.max_single_attachment_bytes, src.name, limits)
 
     # Extensionless files — try to detect type from magic bytes before giving up
     if not ext:
@@ -304,7 +437,7 @@ def convert_to_pdf(src: Path, out_dir: Path) -> Path:
         # Work on a renamed copy so converters that rely on the extension work correctly
         renamed = out_dir / f"{src.name}{ext}"
         shutil.copy2(src, renamed)
-        return convert_to_pdf(renamed, out_dir)
+        return convert_to_pdf(renamed, out_dir, limits=limits)
 
     # OLE2 compound document — could be .msg (Outlook embedded email) or .doc/.xls/.ppt.
     # Both share the same magic bytes, so we try .msg first (more common as an
@@ -313,42 +446,56 @@ def convert_to_pdf(src: Path, out_dir: Path) -> Path:
         msg_path = out_dir / f"{src.stem}.msg"
         shutil.copy2(src, msg_path)
         try:
-            return _email_to_pdf(msg_path, out_dir)
+            pdf = _email_to_pdf(msg_path, out_dir, limits=limits)
+            _check_pdf_page_budget(pdf, limits)
+            return pdf
         except Exception:
             pass
         doc_path = out_dir / f"{src.stem}.doc"
         shutil.copy2(src, doc_path)
-        return convert_to_pdf(doc_path, out_dir)
+        return convert_to_pdf(doc_path, out_dir, limits=limits)
 
     if ext == ".pdf":
-        return src  # no conversion needed; caller uses the original
+        return _checked_pdf(src, limits)  # no conversion needed; caller uses the original
 
     if ext in OFFICE_WORD_EXTS:
         # Try docx2pdf (Word) first; fall back to LibreOffice
         try:
-            return _docx2pdf_to_pdf(src, out_dir)
+            pdf = _docx2pdf_to_pdf(src, out_dir, limits=limits)
         except Exception as primary:
             try:
-                return _libreoffice_to_pdf(src, out_dir)
+                pdf = _libreoffice_to_pdf(src, out_dir, limits=limits)
             except Exception as fallback:
                 raise RuntimeError(
                     f"docx2pdf failed ({primary}); LibreOffice fallback also failed ({fallback})"
                 )
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     if ext in OFFICE_OTHER_EXTS:
-        return _libreoffice_to_pdf(src, out_dir)
+        pdf = _libreoffice_to_pdf(src, out_dir, limits=limits)
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     if ext in IMAGE_EXTS:
-        return _image_to_pdf(src, out_dir)
+        pdf = _image_to_pdf(src, out_dir, limits=limits)
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     if ext in TEXT_EXTS:
-        return _text_to_pdf(src, out_dir)
+        pdf = _text_to_pdf(src, out_dir, limits=limits)
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     if ext in HTML_EXTS:
-        return _html_file_to_pdf(src, out_dir)
+        pdf = _html_file_to_pdf(src, out_dir, limits=limits)
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     if ext in EMAIL_EXTS:
-        return _email_to_pdf(src, out_dir)
+        pdf = _email_to_pdf(src, out_dir, limits=limits)
+        _check_pdf_page_budget(pdf, limits)
+        return pdf
 
     raise ValueError(f"Unsupported file type: '{src.suffix}' ({src.name})")
 
@@ -374,6 +521,28 @@ def _find_unrar() -> str:
     )
 
 
+def _archive_member_is_link(member) -> bool:
+    is_symlink = getattr(member, "is_symlink", None)
+    if callable(is_symlink):
+        try:
+            if is_symlink():
+                return True
+        except Exception:
+            pass
+
+    file_redir = getattr(member, "file_redir", None)
+    if file_redir:
+        return True
+
+    external_attr = getattr(member, "external_attr", None)
+    create_system = getattr(member, "create_system", None)
+    if create_system == 3 and isinstance(external_attr, int):
+        mode = external_attr >> 16
+        return stat.S_ISLNK(mode)
+
+    return False
+
+
 def _safe_extractall(af, extract_dir: Path) -> None:
     """
     Extract all archive members to extract_dir, rejecting any member whose resolved
@@ -382,12 +551,17 @@ def _safe_extractall(af, extract_dir: Path) -> None:
     """
     resolved_base = extract_dir.resolve()
     for member in af.infolist():
-        dest = (extract_dir / member.filename).resolve()
+        member_name = getattr(member, "filename", str(member))
+        if _archive_member_is_link(member):
+            raise RuntimeError(
+                f"Archive member '{member_name}' is a symlink or redirected file — extraction aborted."
+            )
+        dest = (extract_dir / member_name).resolve()
         try:
             dest.relative_to(resolved_base)
         except ValueError:
             raise RuntimeError(
-                f"Path traversal in archive member '{member.filename}' — extraction aborted."
+                f"Path traversal in archive member '{member_name}' — extraction aborted."
             )
         af.extract(member, extract_dir)
 
@@ -409,20 +583,11 @@ def _check_multipart_rar(src: Path) -> None:
     # so nothing to check for old-style; the opener will fail if parts are missing.
 
 
-def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
-    """
-    Extract a ZIP or RAR archive and convert its contents to PDFs.
-
-    Returns a list of merge-part tuples: (label, pdf_path_or_None, children).
-      - Regular file      → (filename, pdf_path, [])
-      - Nested archive    → (archname, None,     [child_parts …])
-
-    Raises RuntimeError on unreadable / oversized / too-deeply-nested archives,
-    missing unrar binary (RAR only), or if any contained file cannot be converted.
-    """
-    if depth > _ARCHIVE_MAX_DEPTH:
+def _extract_archive_contents(src: Path, extract_dir: Path, depth: int, force: bool) -> None:
+    limits = ResourceLimits(force=force)
+    if depth > limits.max_archive_depth:
         raise RuntimeError(
-            f"Archive nesting exceeds maximum depth ({_ARCHIVE_MAX_DEPTH}): {src.name}"
+            f"Archive nesting exceeds maximum depth ({limits.max_archive_depth}): {src.name}"
         )
 
     ext = src.suffix.lower()
@@ -433,8 +598,6 @@ def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
             import rarfile
         except ImportError:
             raise RuntimeError("rarfile not installed: pip install rarfile")
-        # Point rarfile at the unrar binary (only needs to happen once per process,
-        # but setting it each time is harmless and avoids global-state concerns)
         rarfile.UNRAR_TOOL = _find_unrar()
         archive_cls   = rarfile.RarFile
         bad_exc       = (rarfile.BadRarFile, rarfile.NotRarFile, rarfile.NeedFirstVolume)
@@ -446,17 +609,50 @@ def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
 
     try:
         with archive_cls(src) as af:
-            total_bytes = sum(info.file_size for info in af.infolist())
-            if total_bytes > _ARCHIVE_MAX_UNCOMPRESSED:
+            infos = af.infolist()
+            total_bytes = sum(info.file_size for info in infos)
+            if limits.enabled() and total_bytes > limits.max_archive_uncompressed_bytes:
                 raise RuntimeError(
                     f"{archive_label} uncompressed size ({total_bytes // (1024 * 1024)} MB) "
-                    f"exceeds {_ARCHIVE_MAX_UNCOMPRESSED // (1024 * 1024)} MB safety limit: {src.name}"
+                    f"exceeds {limits.max_archive_uncompressed_bytes // (1024 * 1024)} MB safety limit: {src.name}"
                 )
-            extract_dir = out_dir / "extracted"
             extract_dir.mkdir()
             _safe_extractall(af, extract_dir)
     except bad_exc as exc:
         raise RuntimeError(f"Cannot read {archive_label} '{src.name}': {exc}")
+
+
+def _expand_archive(
+    src: Path,
+    out_dir: Path,
+    depth: int = 0,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> list:
+    """
+    Extract a ZIP or RAR archive and convert its contents to PDFs.
+
+    Returns a list of merge-part tuples: (label, pdf_path_or_None, children).
+      - Regular file      → (filename, pdf_path, [])
+      - Nested archive    → (archname, None,     [child_parts …])
+
+    Raises RuntimeError on unreadable / oversized / too-deeply-nested archives,
+    missing unrar binary (RAR only), or if any contained file cannot be converted.
+    """
+    if depth > limits.max_archive_depth:
+        raise RuntimeError(
+            f"Archive nesting exceeds maximum depth ({limits.max_archive_depth}): {src.name}"
+        )
+
+    extract_dir = out_dir / "extracted"
+    run_with_timeout(
+        _extract_archive_contents,
+        limits.timeout(limits.timeout_archive_seconds),
+        f"archive extraction for {src.name}",
+        src,
+        extract_dir,
+        depth,
+        limits.force,
+    )
 
     all_files = sorted(f for f in extract_dir.rglob("*") if f.is_file())
     if not all_files:
@@ -469,10 +665,10 @@ def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
         item_out.mkdir()
 
         if item.suffix.lower() in ARCHIVE_EXTS:
-            children = _expand_archive(item, item_out, depth + 1)
+            children = _expand_archive(item, item_out, depth + 1, limits=limits)
             parts.append((label, None, children))
         else:
-            pdf = convert_to_pdf(item, item_out)
+            pdf = convert_to_pdf(item, item_out, limits=limits)
             parts.append((label, pdf, []))
 
     return parts
@@ -482,7 +678,11 @@ def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
 # PDF merging with bookmarks
 # ---------------------------------------------------------------------------
 
-def merge_pdfs(parts: list, output_path: Path) -> None:
+def merge_pdfs(
+    parts: list,
+    output_path: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> None:
     """
     Merge parts into one PDF with a nested bookmark outline.
 
@@ -497,6 +697,11 @@ def merge_pdfs(parts: list, output_path: Path) -> None:
 
     All source PDFs are kept open until save() completes.
     """
+    try:
+        import pikepdf
+    except ImportError:
+        raise RuntimeError("pikepdf is required: pip install pikepdf")
+
     merged  = pikepdf.Pdf.new()
     sources = []
 
@@ -507,6 +712,7 @@ def merge_pdfs(parts: list, output_path: Path) -> None:
             page_num = len(merged.pages)          # bookmark points here
 
             if pdf_path is not None:
+                _check_pdf_page_budget(pdf_path, limits)
                 src = pikepdf.Pdf.open(pdf_path)
                 sources.append(src)
                 merged.pages.extend(src.pages)
@@ -553,6 +759,7 @@ def process_email_folder(
     email_folder: Path,
     combined_dir: Path,
     errors: list,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> bool:
     """
     Produce a combined PDF for one email folder.
@@ -563,14 +770,33 @@ def process_email_folder(
     attachments    = sorted(
         f for f in attachments_dir.iterdir() if f.is_file()
     ) if attachments_dir.exists() else []
+    check_count(len(attachments), limits.max_attachments, "attachment", limits)
+    total_attachment_bytes = sum(f.stat().st_size for f in attachments)
+    check_bytes_size(
+        total_attachment_bytes,
+        limits.max_total_attachment_bytes,
+        f"total attachments for {email_folder.name}",
+        limits,
+    )
 
     out_path = combined_dir / f"{email_folder.name}.pdf"
 
     # No attachments — copy the email PDF directly
     if not attachments:
+        _check_pdf_page_budget(email_pdf, limits)
         shutil.copy2(email_pdf, out_path)
         print(f"  (no attachments — email PDF copied)")
         return True
+
+    deadline = None
+    if limits.enabled():
+        deadline = time.monotonic() + limits.timeout_merge_email_seconds
+
+    def _check_folder_deadline() -> None:
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError(
+                f"merge for {email_folder.name} exceeded {limits.timeout_merge_email_seconds}s timeout"
+            )
 
     with tempfile.TemporaryDirectory() as _tmp:
         tmp_dir = Path(_tmp)
@@ -578,16 +804,18 @@ def process_email_folder(
         parts   = [("Email", email_pdf, [])]
 
         for i, att in enumerate(attachments):
+            _check_folder_deadline()
+            check_file_size(att, limits.max_single_attachment_bytes, att.name, limits)
             att_tmp = tmp_dir / f"att_{i}"
             att_tmp.mkdir()
             try:
                 if att.suffix.lower() in ARCHIVE_EXTS:
-                    children = _expand_archive(att, att_tmp)
+                    children = _expand_archive(att, att_tmp, limits=limits)
                     parts.append((att.name, None, children))
                     n_files = sum(1 for _, p, _ in children if p is not None)
                     print(f"  [OK]     {att.name}  ({n_files} file(s) inside)")
                 else:
-                    pdf = convert_to_pdf(att, att_tmp)
+                    pdf = convert_to_pdf(att, att_tmp, limits=limits)
                     parts.append((att.name, pdf, []))
                     print(f"  [OK]     {att.name}")
             except Exception as exc:
@@ -599,7 +827,8 @@ def process_email_folder(
                 print(f"  [ERROR]  {att.name}: {exc}")
                 return False
 
-        merge_pdfs(parts, out_path)
+        _check_folder_deadline()
+        merge_pdfs(parts, out_path, limits=limits)
 
     n = len(parts) - 1  # attachments only (excludes email entry)
     print(f"  -> merged ({n} attachment{'s' if n != 1 else ''})")
@@ -611,8 +840,26 @@ def process_email_folder(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        output_dir = Path(sys.argv[1]).resolve()
+    parser = argparse.ArgumentParser(
+        description="Merge each converted email PDF with its attachments."
+    )
+    parser.add_argument(
+        "output_dir",
+        nargs="?",
+        default=None,
+        help="Converted email output directory. Defaults to output/ next to this script.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Disable safety limits and timeouts for unusually large or slow inputs",
+    )
+    args = parser.parse_args()
+    limits = ResourceLimits(force=args.force)
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
     else:
         output_dir = Path(__file__).parent / "output"
 
@@ -639,7 +886,7 @@ def main() -> None:
 
     for folder in folders:
         print(f"[{folder.name}]")
-        ok = process_email_folder(folder, combined_dir, errors)
+        ok = process_email_folder(folder, combined_dir, errors, limits=limits)
         if ok:
             succeeded += 1
         else:
