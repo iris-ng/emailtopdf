@@ -7,6 +7,7 @@ Usage:
     python emailtopdf.py path/to/emails/              # convert entire folder
     python emailtopdf.py file.eml --renderer weasyprint
     python emailtopdf.py path/to/emails/ --pdfa      # PDF/A-2b output (needs Ghostscript)
+    python emailtopdf.py path/to/emails/ --force     # bypass size/time safety limits
 """
 
 import email
@@ -26,6 +27,16 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from html import escape
+
+from resource_limits import (
+    DEFAULT_LIMITS,
+    ResourceLimits,
+    check_bytes_size,
+    check_count,
+    check_file_size,
+    check_text_size,
+    run_with_timeout,
+)
 
 # Reconfigure stdout/stderr to UTF-8 so that subjects or paths containing
 # non-Latin characters (e.g. Chinese, Arabic) don't crash print() on
@@ -103,8 +114,23 @@ def _format_date(date: Optional[datetime]) -> str:
 # .eml parser
 # ---------------------------------------------------------------------------
 
-def parse_eml(path: Path) -> EmailData:
+def _validate_email_payload_limits(data: EmailData, limits: ResourceLimits) -> None:
+    """Validate parsed attachment budgets before rendering or writing output."""
+    attachments = list(data.attachments)
+    check_count(len(attachments), limits.max_attachments, "attachment", limits)
+    total_bytes = 0
+    for att in attachments:
+        size = len(att.data)
+        total_bytes += size
+        check_bytes_size(size, limits.max_single_attachment_bytes, att.filename, limits)
+        if att.is_inline:
+            check_bytes_size(size, limits.max_inline_image_bytes, f"inline image {att.filename}", limits)
+    check_bytes_size(total_bytes, limits.max_total_attachment_bytes, "total attachment data", limits)
+
+
+def parse_eml(path: Path, limits: ResourceLimits = DEFAULT_LIMITS) -> EmailData:
     """Parse an .eml file and return EmailData."""
+    check_file_size(path, limits.max_email_bytes, str(path), limits)
     raw = path.read_bytes()
     msg = email.message_from_bytes(raw, policy=email.policy.compat32)
 
@@ -127,7 +153,10 @@ def parse_eml(path: Path) -> EmailData:
     text_body   = None
     attachments = []
 
+    part_count = 0
     for part in msg.walk():
+        part_count += 1
+        check_count(part_count, limits.max_attachments * 4, "MIME part", limits)
         content_type  = part.get_content_type()
         disposition   = str(part.get("Content-Disposition", ""))
         content_id    = part.get("Content-ID", "").strip("<>")
@@ -167,20 +196,23 @@ def parse_eml(path: Path) -> EmailData:
                     cid=content_id or None,
                 ))
 
-    return EmailData(
+    data = EmailData(
         subject=subject, from_=from_, to=to, cc=cc, bcc=bcc,
         date=date, html_body=html_body, text_body=text_body,
         attachments=attachments, message_id=message_id,
         source_file=str(path),
     )
+    _validate_email_payload_limits(data, limits)
+    return data
 
 
 # ---------------------------------------------------------------------------
 # .msg parser
 # ---------------------------------------------------------------------------
 
-def parse_msg(path: Path) -> EmailData:
+def parse_msg(path: Path, limits: ResourceLimits = DEFAULT_LIMITS) -> EmailData:
     """Parse an Outlook .msg file and return EmailData."""
+    check_file_size(path, limits.max_email_bytes, str(path), limits)
     try:
         import extract_msg
     except ImportError:
@@ -294,26 +326,38 @@ def parse_msg(path: Path) -> EmailData:
             filename=fname, data=data,
             content_type=content_type, is_inline=is_inline, cid=cid,
         ))
+        _validate_email_payload_limits(
+            EmailData(
+                subject=subject, from_=from_, to=to, cc=cc, bcc=bcc,
+                date=date, html_body=html_body, text_body=text_body,
+                attachments=attachments, message_id=message_id,
+                source_file=str(path),
+            ),
+            limits,
+        )
 
     msg.close()  # release the OLE2 file handle; without this Windows keeps a lock
 
-    return EmailData(
+    data = EmailData(
         subject=subject, from_=from_, to=to, cc=cc, bcc=bcc,
         date=date, html_body=html_body, text_body=text_body,
         attachments=attachments, message_id=message_id,
         source_file=str(path),
     )
+    _validate_email_payload_limits(data, limits)
+    return data
 
 
 # ---------------------------------------------------------------------------
 # CID image resolution
 # ---------------------------------------------------------------------------
 
-def _build_cid_map(attachments: list) -> dict:
+def _build_cid_map(attachments: list, limits: ResourceLimits = DEFAULT_LIMITS) -> dict:
     """Build { cid -> data:... URI } for all inline images."""
     cid_map = {}
     for att in attachments:
         if att.is_inline and att.cid and att.data:
+            check_bytes_size(len(att.data), limits.max_inline_image_bytes, f"inline image {att.filename}", limits)
             b64 = base64.b64encode(att.data).decode("ascii")
             ct  = att.content_type or "image/png"
             cid_map[att.cid] = f"data:{ct};base64,{b64}"
@@ -573,7 +617,7 @@ def _build_header_block(data: EmailData) -> str:
     )
 
 
-def build_html(data: EmailData) -> str:
+def build_html(data: EmailData, limits: ResourceLimits = DEFAULT_LIMITS) -> str:
     """
     Assemble a complete, self-contained HTML document for PDF rendering.
 
@@ -585,7 +629,7 @@ def build_html(data: EmailData) -> str:
 
     CSS inlining (_inline_css) is applied by convert_email on the assembled doc.
     """
-    cid_map      = _build_cid_map(data.attachments)
+    cid_map      = _build_cid_map(data.attachments, limits)
     header_block = _build_header_block(data)
 
     if data.html_body:
@@ -594,7 +638,7 @@ def build_html(data: EmailData) -> str:
         head_styles  = _extract_head_styles(processed)
         body_content = _extract_body_content(processed)
 
-        return (
+        html = (
             f"<!DOCTYPE html>\n<html>\n<head>\n"
             f'<meta charset="UTF-8">\n'
             f"<style>{_HEADER_CSS}</style>\n"
@@ -604,9 +648,11 @@ def build_html(data: EmailData) -> str:
             f'<div class="etp-body">{body_content}</div>\n'
             f"</body>\n</html>"
         )
+        check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
+        return html
 
     if data.text_body:
-        return (
+        html = (
             f"<!DOCTYPE html>\n<html>\n<head>\n"
             f'<meta charset="UTF-8">\n'
             f"<style>{_HEADER_CSS}\n"
@@ -617,13 +663,17 @@ def build_html(data: EmailData) -> str:
             f"<pre>{escape(data.text_body)}</pre>\n"
             f"</body>\n</html>"
         )
+        check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
+        return html
 
-    return (
+    html = (
         f'<!DOCTYPE html>\n<html>\n<head><meta charset="UTF-8">'
         f"<style>{_HEADER_CSS}</style></head>\n<body>\n"
         f"{header_block}\n<p><em>(No body content)</em></p>\n"
         f"</body>\n</html>"
     )
+    check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -667,10 +717,20 @@ class PlaywrightPool:
         if self._pw:
             self._pw.stop()
 
-    def render_pdf(self, html: str, output_path: Path) -> None:
+    def render_pdf(
+        self,
+        html: str,
+        output_path: Path,
+        limits: ResourceLimits = DEFAULT_LIMITS,
+    ) -> None:
         """Render HTML -> PDF in a fresh page (reuses the shared browser instance)."""
+        check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
         page = self._browser.new_page()
         try:
+            timeout_ms = limits.timeout(limits.timeout_playwright_email_seconds)
+            if timeout_ms is not None:
+                page.set_default_timeout(timeout_ms * 1000)
+                page.set_default_navigation_timeout(timeout_ms * 1000)
             page.route("**/*", lambda route: route.abort())
             page.set_content(html, wait_until="domcontentloaded")
             page.pdf(
@@ -691,11 +751,14 @@ def render_pdf_playwright(
     html: str,
     output_path: Path,
     pool: Optional[PlaywrightPool] = None,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> None:
     """Render HTML -> PDF via headless Chromium. Uses pool if provided."""
     if pool is not None:
-        pool.render_pdf(html, output_path)
+        pool.render_pdf(html, output_path, limits=limits)
         return
+
+    check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
 
     # Standalone path (no pool) — same network-blocking improvements applied
     try:
@@ -711,6 +774,10 @@ def render_pdf_playwright(
         browser = p.chromium.launch()
         page    = browser.new_page()
         try:
+            timeout_ms = limits.timeout(limits.timeout_playwright_email_seconds)
+            if timeout_ms is not None:
+                page.set_default_timeout(timeout_ms * 1000)
+                page.set_default_navigation_timeout(timeout_ms * 1000)
             page.route("**/*", lambda route: route.abort())
             page.set_content(html, wait_until="domcontentloaded")
             page.pdf(
@@ -724,7 +791,7 @@ def render_pdf_playwright(
             browser.close()
 
 
-def render_pdf_weasyprint(html: str, output_path: Path) -> None:
+def _render_pdf_weasyprint_impl(html: str, output_path: Path) -> None:
     """Render HTML -> PDF via WeasyPrint (pure Python, no browser needed)."""
     try:
         from weasyprint import HTML
@@ -737,6 +804,21 @@ def render_pdf_weasyprint(html: str, output_path: Path) -> None:
         raise URLFetchingError(f"Blocked external URL: {url}")
 
     HTML(string=html, url_fetcher=_block_network).write_pdf(str(output_path))
+
+
+def render_pdf_weasyprint(
+    html: str,
+    output_path: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> None:
+    check_text_size(html, limits.max_generated_html_bytes, "generated email HTML", limits)
+    run_with_timeout(
+        _render_pdf_weasyprint_impl,
+        limits.timeout(limits.timeout_weasyprint_seconds),
+        f"WeasyPrint render for {output_path.name}",
+        html,
+        output_path,
+    )
 
 
 RENDERERS = {
@@ -783,7 +865,10 @@ def _inject_xmp_metadata(pdf_path: Path, data: EmailData) -> None:
 # PDF/A conversion
 # ---------------------------------------------------------------------------
 
-def _convert_to_pdfa(pdf_path: Path) -> bool:
+def _convert_to_pdfa(
+    pdf_path: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> bool:
     """
     Convert PDF -> PDF/A-2b via Ghostscript CLI (best-effort).
 
@@ -818,7 +903,7 @@ def _convert_to_pdfa(pdf_path: Path) -> bool:
                 str(pdf_path),
             ],
             capture_output=True,
-            timeout=120,
+            timeout=limits.timeout(limits.timeout_ghostscript_seconds),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         tmp_path.unlink(missing_ok=True)
@@ -880,8 +965,13 @@ def make_output_folder_name(data: EmailData) -> str:
 # Attachment extraction
 # ---------------------------------------------------------------------------
 
-def extract_attachments(data: EmailData, output_dir: Path) -> list:
+def extract_attachments(
+    data: EmailData,
+    output_dir: Path,
+    limits: ResourceLimits = DEFAULT_LIMITS,
+) -> list:
     """Save non-inline attachments to output_dir/attachments/. Returns metadata list."""
+    _validate_email_payload_limits(data, limits)
     non_inline = [a for a in data.attachments if not a.is_inline]
     if not non_inline:
         return []
@@ -945,6 +1035,7 @@ def convert_email(
     renderer: str = "playwright",
     pool: Optional[PlaywrightPool] = None,
     pdfa: bool = False,
+    limits: ResourceLimits = DEFAULT_LIMITS,
 ) -> Path:
     """
     Convert one .eml or .msg file to PDF and extract attachments.
@@ -954,9 +1045,9 @@ def convert_email(
 
     print(f"  Parsing {input_path.name} ...")
     if suffix == ".eml":
-        data = parse_eml(input_path)
+        data = parse_eml(input_path, limits=limits)
     elif suffix == ".msg":
-        data = parse_msg(input_path)
+        data = parse_msg(input_path, limits=limits)
     else:
         raise ValueError(f"Unsupported format: {suffix!r} (expected .eml or .msg)")
 
@@ -965,20 +1056,21 @@ def convert_email(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Building HTML ...")
-    html = build_html(data)
+    html = build_html(data, limits=limits)
     html = _inline_css(html)
+    check_text_size(html, limits.max_generated_html_bytes, "inlined email HTML", limits)
 
     pdf_path = output_dir / f"{output_dir.name}.pdf"
 
     print(f"  Rendering PDF ({renderer}) ...")
     if renderer == "playwright":
-        render_pdf_playwright(html, pdf_path, pool=pool)
+        render_pdf_playwright(html, pdf_path, pool=pool, limits=limits)
     else:
-        RENDERERS[renderer](html, pdf_path)
+        RENDERERS[renderer](html, pdf_path, limits=limits)
 
     if pdfa and renderer == "playwright":
         print(f"  Converting to PDF/A-2b ...")
-        if _convert_to_pdfa(pdf_path):
+        if _convert_to_pdfa(pdf_path, limits=limits):
             print(f"    PDF/A-2b conversion successful.")
         else:
             print(f"    PDF/A-2b: Ghostscript not found or conversion failed — skipped.")
@@ -987,12 +1079,28 @@ def convert_email(
     _inject_xmp_metadata(pdf_path, data)
 
     print(f"  Extracting attachments ...")
-    saved = extract_attachments(data, output_dir)
+    saved = extract_attachments(data, output_dir, limits=limits)
     save_metadata(data, output_dir, saved)
 
     n = len(saved)
     print(f"  -> {output_dir}  ({n} attachment{'s' if n != 1 else ''})")
     return output_dir
+
+
+def _convert_email_worker(
+    input_path: Path,
+    output_base: Path,
+    renderer: str,
+    pdfa: bool,
+    force: bool,
+) -> Path:
+    return convert_email(
+        input_path,
+        output_base,
+        renderer=renderer,
+        pdfa=pdfa,
+        limits=ResourceLimits(force=force),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1138,14 @@ def main():
         default=False,
         help="Convert output to PDF/A-2b via Ghostscript (requires gs / gswin64c in PATH)",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Disable safety limits and timeouts for unusually large or slow inputs",
+    )
     args = parser.parse_args()
+    limits = ResourceLimits(force=args.force)
 
     # Collect input files as (file_path, input_root) tuples so we can mirror
     # the directory structure in the output.
@@ -1072,7 +1187,7 @@ def main():
         dest.mkdir(parents=True, exist_ok=True)
         return dest
 
-    if args.renderer == "playwright":
+    if args.force and args.renderer == "playwright":
         # Single Chromium instance shared across the whole batch
         with PlaywrightPool() as pool:
             for f, input_root in input_files:
@@ -1081,6 +1196,7 @@ def main():
                     convert_email(
                         f, _email_output_base(f, input_root),
                         renderer=args.renderer, pool=pool, pdfa=args.pdfa,
+                        limits=limits,
                     )
                 except Exception as exc:
                     print(f"  ERROR: {exc}", file=sys.stderr)
@@ -1089,9 +1205,15 @@ def main():
         for f, input_root in input_files:
             print(f"[{f.name}]")
             try:
-                convert_email(
-                    f, _email_output_base(f, input_root),
-                    renderer=args.renderer, pdfa=args.pdfa,
+                run_with_timeout(
+                    _convert_email_worker,
+                    limits.timeout(limits.timeout_email_seconds),
+                    f"conversion for {f.name}",
+                    f,
+                    _email_output_base(f, input_root),
+                    args.renderer,
+                    args.pdfa,
+                    args.force,
                 )
             except Exception as exc:
                 print(f"  ERROR: {exc}", file=sys.stderr)
