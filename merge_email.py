@@ -2,21 +2,40 @@
 """
 merge_email.py — Merge each email PDF with its attachments into a single combined PDF.
 
-For every email folder in output_dir, produces one merged PDF in a sibling
-_combined folder:
+Walks <folder> recursively, at any depth, until it reaches an "email folder":
+a leaf folder that holds the unpacked email (email PDF + metadata.json, plus an
+optional attachments/ subfolder). Walking stops at that level, so nothing
+inside an email folder is mistaken for another email.
 
-    output/                                      <- source (output_dir)
-      2024.03.15 09.30 - Q1 Budget Review/
-        2024.03.15 09.30 - Q1 Budget Review.pdf  <- email body
-        metadata.json
-        attachments/
-          report.xlsx
-          contract.pdf
-          photo.jpg
+For every email folder found, one merged PDF is written to a sibling
+<folder>_combined tree that mirrors the source subfolder structure:
 
-    output_combined/                             <- created automatically
-      2024.03.15 09.30 - Q1 Budget Review.pdf   <- email + all attachments merged
-      errors.txt                                 <- written on any failure
+    Matter/                                          <- source (<folder>)
+      Custodian A/
+        Inbox/
+          2020.06.19 16.41 - RE ORIGINAL.../         <- email folder
+            2020.06.19 16.41 - RE ORIGINAL....pdf    <- email body
+            metadata.json
+            attachments/
+              invoice.pdf
+              contract.docx
+      Custodian B/
+        2021.01.04 09.12 - FW Draft.../              <- email folder
+          ...
+
+    Matter_combined/                                 <- created automatically
+      Custodian A/
+        Inbox/
+          2020.06.19 16.41 - RE ORIGINAL....pdf      <- email + attachments merged
+      Custodian B/
+        2021.01.04 09.12 - FW Draft....pdf
+      errors.txt                                     <- written on any failure
+
+An email folder is identified as follows:
+  1. It contains {folder name}.pdf, or
+  2. It contains metadata.json and exactly one PDF at its top level.
+A folder with metadata.json but zero or several top-level PDFs (none matching
+the folder name) is flagged in errors.txt and skipped.
 
 Merge order: email PDF first, then attachments in filename order.
 Each attachment gets a named PDF bookmark pointing to its first page.
@@ -27,30 +46,31 @@ and the failure is flagged to the console and appended to errors.txt.
 Conversion support
 ------------------
   .pdf                     merged directly (pikepdf)
-  .docx .doc .rtf .odt     docx2pdf (Word/LibreOffice) -> LibreOffice fallback
+  .docx .doc .rtf .odt     Microsoft Word (pywin32 on Windows, docx2pdf on
+                           macOS) -> LibreOffice fallback
   .xlsx .xls .pptx .ppt    LibreOffice headless
   .jpg .jpeg .png .gif
   .bmp .tiff .tif .webp    img2pdf (lossless, preserves DPI)
   .txt .csv                Playwright (rendered as preformatted text)
   .html .htm               Playwright
   .eml .msg                emailtopdf pipeline (recursive)
-  .zip                     extracted, contents converted; nested bookmarks
-  .rar                     extracted via rarfile + UnRAR binary; nested bookmarks
-                           (requires: pip install rarfile + WinRAR/UnRAR in PATH)
   anything else            unsupported -> error, email skipped
 
 Usage:
-    python merge_email.py                         # uses output/ next to script
-    python merge_email.py path/to/output_dir/     # explicit path
+    python merge_email.py <folder name>
+
+Requirements on Windows: pip install pikepdf img2pdf pywin32
+LibreOffice (optional fallback) is found on PATH, in its default install
+folder, or via the LIBREOFFICE_PATH environment variable.
 """
 
+import os
 import sys
 import shutil
 import tempfile
 import subprocess
 import traceback
 import zipfile
-import re as _re
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -76,79 +96,173 @@ except ImportError:
 # File-type sets
 # ---------------------------------------------------------------------------
 
-OFFICE_WORD_EXTS  = {".docx", ".doc", ".rtf", ".odt"}   # .doc handled via docx2pdf -> LibreOffice
+OFFICE_WORD_EXTS  = {".docx", ".doc", ".rtf", ".odt"}
 OFFICE_OTHER_EXTS = {".xlsx", ".xls", ".pptx", ".ppt", ".ods", ".odp"}
 IMAGE_EXTS        = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
 TEXT_EXTS         = {".txt", ".csv"}
 HTML_EXTS         = {".html", ".htm"}
 EMAIL_EXTS        = {".eml", ".msg"}
-ARCHIVE_EXTS      = {".zip", ".rar"}
+ZIP_EXTS          = {".zip"}
 
-_ARCHIVE_MAX_DEPTH        = 3                  # maximum nesting depth for archives-within-archives
-_ARCHIVE_MAX_UNCOMPRESSED = 500 * 1024 * 1024  # 500 MB uncompressed size guard
-
-# Common Windows locations for the UnRAR binary (tried in order if not in PATH)
-_UNRAR_SEARCH_PATHS = [
-    r"C:\Program Files\WinRAR\UnRAR.exe",
-    r"C:\Program Files (x86)\WinRAR\UnRAR.exe",
-    r"C:\Program Files\WinRAR\WinRAR.exe",
-]
+_ZIP_MAX_DEPTH        = 3          # maximum nesting depth for zips-within-zips
+_ZIP_MAX_UNCOMPRESSED = 500 * 1024 * 1024   # 500 MB uncompressed size guard
 
 
 # ---------------------------------------------------------------------------
 # Individual converters
 # ---------------------------------------------------------------------------
 
+def _find_libreoffice() -> str:
+    """Locate soffice: LIBREOFFICE_PATH env var, then PATH, then default install folders."""
+    env = os.environ.get("LIBREOFFICE_PATH")
+    if env and Path(env).is_file():
+        return env
+    for exe in ("soffice", "libreoffice"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "LibreOffice/program/soffice.exe",
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "LibreOffice/program/soffice.exe",
+        Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    raise RuntimeError(
+        "LibreOffice not found (checked LIBREOFFICE_PATH, PATH and the default install folder)"
+    )
+
+
+def _short_copy(src: Path, out_dir: Path, stem: str) -> Path:
+    """
+    Copy src to a short path inside out_dir by rewriting its bytes.
+    This avoids Windows 260-character path limits on deeply nested email folders,
+    and drops the 'downloaded from the internet' mark that makes Word open
+    attachments in Protected View (which breaks automation).
+    """
+    dst = out_dir / f"{stem}{src.suffix.lower()}"
+    dst.write_bytes(src.read_bytes())
+    return dst
+
+
 def _libreoffice_to_pdf(src: Path, out_dir: Path) -> Path:
     """Convert any LibreOffice-compatible file to PDF via headless LibreOffice."""
-    for exe in ("soffice", "libreoffice"):
-        if shutil.which(exe):
-            break
-    else:
-        raise RuntimeError(
-            "LibreOffice not found in PATH — install from https://www.libreoffice.org/"
-        )
+    exe = _find_libreoffice()
+    lo_dir = out_dir / "lo"
+    lo_dir.mkdir(exist_ok=True)
+    work = _short_copy(src, lo_dir, "lo_src")
     result = subprocess.run(
-        [exe, "--headless", "--convert-to", "pdf", "--outdir", str(out_dir), str(src)],
+        [exe, "--headless", "--convert-to", "pdf", "--outdir", str(lo_dir), str(work)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         raise RuntimeError(f"LibreOffice exited {result.returncode}: {result.stderr.strip()}")
-    pdf = out_dir / f"{src.stem}.pdf"
+    pdf = lo_dir / f"{work.stem}.pdf"
     if not pdf.exists():
-        raise RuntimeError(f"LibreOffice did not produce expected output: {pdf}")
+        raise RuntimeError(f"LibreOffice did not produce a PDF for {src.name}")
     return pdf
 
 
-def _docx2pdf_to_pdf(src: Path, out_dir: Path) -> Path:
-    """Convert a Word-compatible file to PDF via docx2pdf (uses Word on Windows).
-
-    Retries once after a short delay — Word COM can disconnect mid-session when
-    converting many documents in sequence.
+def _word_com_to_pdf(src: Path, out_dir: Path) -> Path:
     """
+    Convert a Word-compatible file to PDF by driving Microsoft Word directly
+    (Windows only). Replaces docx2pdf, which fails with 'Open.SaveAs' whenever
+    Word cannot open the file (Protected View, long path, password, corruption)
+    and hides the real reason.
+    """
+    try:
+        import pythoncom
+        import win32com.client
+        import win32com.client.dynamic
+    except ImportError:
+        raise RuntimeError("pywin32 not installed: pip install pywin32")
+
+    word_dir = out_dir / "word"
+    word_dir.mkdir(exist_ok=True)
+    work = _short_copy(src, word_dir, "word_src")
+    out  = word_dir / "word_src.pdf"
+
+    pythoncom.CoInitialize()
+    word = None
+    doc  = None
+    try:
+        # Separate, invisible Word instance; late-bound so a stale gen_py cache cannot interfere
+        word = win32com.client.dynamic.Dispatch(
+            win32com.client.DispatchEx("Word.Application")._oleobj_
+        )
+        word.Visible = False
+        word.DisplayAlerts = 0                     # wdAlertsNone: no dialogs
+        try:
+            word.AutomationSecurity = 3            # msoAutomationSecurityForceDisable: no macros
+        except Exception:
+            pass
+
+        doc = word.Documents.Open(
+            FileName=str(work),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            PasswordDocument="__no_password__",    # password-protected files fail fast, no prompt
+            Visible=False,
+            OpenAndRepair=True,
+            NoEncodingDialog=True,
+        )
+        if doc is None:
+            raise RuntimeError("Word did not return an open document (Protected View or blocked file)")
+
+        doc.ExportAsFixedFormat(str(out), 17)      # wdExportFormatPDF
+
+    except pythoncom.com_error as exc:
+        info = exc.excepinfo[2] if exc.excepinfo and exc.excepinfo[2] else str(exc)
+        hint = ""
+        if "password" in str(info).lower():
+            hint = " (file is password-protected)"
+        raise RuntimeError(f"Word could not convert the file: {info.strip()}{hint}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(0)                       # wdDoNotSaveChanges
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit(0)
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+    if not out.exists():
+        raise RuntimeError("Word finished but no PDF was produced")
+    return out
+
+
+def _docx2pdf_to_pdf(src: Path, out_dir: Path) -> Path:
+    """Convert a Word-compatible file to PDF via docx2pdf (macOS, uses Word)."""
     try:
         from docx2pdf import convert
     except ImportError:
         raise RuntimeError("docx2pdf not installed: pip install docx2pdf")
-    import time
-    out = out_dir / f"{src.stem}.pdf"
-    last_exc = None
-    for attempt in range(2):
+    d2p_dir = out_dir / "d2p"
+    d2p_dir.mkdir(exist_ok=True)
+    work = _short_copy(src, d2p_dir, "d2p_src")
+    out  = d2p_dir / "d2p_src.pdf"
+    convert(str(work), str(out))
+    if not out.exists():
+        raise RuntimeError("docx2pdf did not produce a PDF")
+    return out
+
+
+def _word_to_pdf(src: Path, out_dir: Path) -> Path:
+    """Microsoft Word first (COM on Windows, docx2pdf on macOS), then LibreOffice."""
+    primary = _word_com_to_pdf if sys.platform == "win32" else _docx2pdf_to_pdf
+    try:
+        return primary(src, out_dir)
+    except Exception as first:
         try:
-            convert(str(src), str(out))
-            if out.exists():
-                return out
-            raise RuntimeError(f"docx2pdf produced no output for '{src.name}'")
-        except Exception as exc:
-            last_exc = exc
-            if out.exists():
-                try:
-                    out.unlink()      # remove any partial file before retry
-                except OSError:
-                    pass              # Word may still hold the output open; ignore
-            if attempt == 0:
-                time.sleep(3)         # give Word time to recover before retry
-    raise RuntimeError(f"docx2pdf failed after retry: {last_exc or 'no output produced'}")
+            return _libreoffice_to_pdf(src, out_dir)
+        except Exception as fallback:
+            raise RuntimeError(f"{first}; LibreOffice fallback also failed: {fallback}")
 
 
 def _image_to_pdf(src: Path, out_dir: Path) -> Path:
@@ -220,67 +334,6 @@ def _email_to_pdf(src: Path, out_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Magic-byte file-type detection (for extensionless attachments)
-# ---------------------------------------------------------------------------
-
-# (magic_bytes, guessed_extension)
-# Ordered: more-specific signatures first.
-# OLE2 (\xd0\xcf\x11\xe0) is NOT listed here — it is handled separately in
-# convert_to_pdf because both .msg and .doc share the same magic bytes.
-_MAGIC_SIGNATURES = [
-    (b"%PDF",              ".pdf"),
-    (b"Rar!\x1a\x07",     ".rar"),
-    (b"PK\x03\x04",       ".zip"),    # ZIP / OOXML (.docx .xlsx .pptx are ZIP inside)
-    (b"{\rtf",            ".rtf"),
-    (b"<html",            ".html"),
-    (b"<!doctype",        ".html"),
-    (b"<?xml",            ".xml"),
-]
-
-_OLE2_MAGIC = b"\xd0\xcf\x11\xe0"   # OLE2 compound document header
-
-# EML-style headers that appear at the start of plain-text email files
-_EML_HEADER_PREFIXES = (b"MIME-Version:", b"Content-Type:", b"From:", b"Date:", b"Received:")
-
-
-def _sniff_extension(src: Path) -> str:
-    """
-    Read the first 16 bytes of src and return a best-guess file extension
-    (including the leading dot), or '' if the type cannot be determined.
-
-    Also handles extensionless files that are plain-text emails (.eml)
-    by scanning the first 512 bytes for RFC 2822 header keywords.
-    """
-    try:
-        header = src.read_bytes()[:512]
-    except OSError:
-        return ""
-
-    peek = header[:16]
-    # OLE2 is ambiguous — signal it separately so convert_to_pdf can try both
-    if peek.startswith(_OLE2_MAGIC):
-        return ".ole2"
-
-    for magic, ext in _MAGIC_SIGNATURES:
-        if peek.lower().startswith(magic.lower()):
-            return ext
-
-    # Plain-text email check — look for RFC 2822 headers in the first 512 bytes
-    for prefix in _EML_HEADER_PREFIXES:
-        if prefix.lower() in header.lower():
-            return ".eml"
-
-    # If it decodes cleanly as UTF-8, treat as plain text
-    try:
-        header.decode("utf-8")
-        return ".txt"
-    except UnicodeDecodeError:
-        pass
-
-    return ""
-
-
-# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -293,47 +346,11 @@ def convert_to_pdf(src: Path, out_dir: Path) -> Path:
     """
     ext = src.suffix.lower()
 
-    # Extensionless files — try to detect type from magic bytes before giving up
-    if not ext:
-        ext = _sniff_extension(src)
-        if not ext:
-            raise ValueError(
-                f"Cannot determine file type for '{src.name}' "
-                f"(no extension, unrecognised file signature)"
-            )
-        # Work on a renamed copy so converters that rely on the extension work correctly
-        renamed = out_dir / f"{src.name}{ext}"
-        shutil.copy2(src, renamed)
-        return convert_to_pdf(renamed, out_dir)
-
-    # OLE2 compound document — could be .msg (Outlook embedded email) or .doc/.xls/.ppt.
-    # Both share the same magic bytes, so we try .msg first (more common as an
-    # extensionless email attachment) then fall back to .doc.
-    if ext == ".ole2":
-        msg_path = out_dir / f"{src.stem}.msg"
-        shutil.copy2(src, msg_path)
-        try:
-            return _email_to_pdf(msg_path, out_dir)
-        except Exception:
-            pass
-        doc_path = out_dir / f"{src.stem}.doc"
-        shutil.copy2(src, doc_path)
-        return convert_to_pdf(doc_path, out_dir)
-
     if ext == ".pdf":
         return src  # no conversion needed; caller uses the original
 
     if ext in OFFICE_WORD_EXTS:
-        # Try docx2pdf (Word) first; fall back to LibreOffice
-        try:
-            return _docx2pdf_to_pdf(src, out_dir)
-        except Exception as primary:
-            try:
-                return _libreoffice_to_pdf(src, out_dir)
-            except Exception as fallback:
-                raise RuntimeError(
-                    f"docx2pdf failed ({primary}); LibreOffice fallback also failed ({fallback})"
-                )
+        return _word_to_pdf(src, out_dir)
 
     if ext in OFFICE_OTHER_EXTS:
         return _libreoffice_to_pdf(src, out_dir)
@@ -354,122 +371,52 @@ def convert_to_pdf(src: Path, out_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Archive expansion (ZIP and RAR)
+# Zip expansion
 # ---------------------------------------------------------------------------
 
-def _find_unrar() -> str:
+def _expand_zip(src: Path, out_dir: Path, depth: int = 0) -> list:
     """
-    Return the path to a usable UnRAR binary, or raise RuntimeError.
-    Checks PATH first, then common Windows install locations.
-    """
-    for name in ("unrar", "UnRAR"):
-        if shutil.which(name):
-            return shutil.which(name)
-    for path in _UNRAR_SEARCH_PATHS:
-        if Path(path).exists():
-            return path
-    raise RuntimeError(
-        "UnRAR binary not found. Install WinRAR (https://www.rarlab.com/) "
-        "or the free UnRAR utility and ensure it is in PATH."
-    )
-
-
-def _safe_extractall(af, extract_dir: Path) -> None:
-    """
-    Extract all archive members to extract_dir, rejecting any member whose resolved
-    destination path escapes extract_dir (zip-slip / path-traversal guard).
-    Works with both zipfile.ZipFile and rarfile.RarFile instances.
-    """
-    resolved_base = extract_dir.resolve()
-    for member in af.infolist():
-        dest = (extract_dir / member.filename).resolve()
-        try:
-            dest.relative_to(resolved_base)
-        except ValueError:
-            raise RuntimeError(
-                f"Path traversal in archive member '{member.filename}' — extraction aborted."
-            )
-        af.extract(member, extract_dir)
-
-
-def _check_multipart_rar(src: Path) -> None:
-    """
-    Raise RuntimeError if src looks like a RAR continuation part (partN where N > 1).
-    Only part1 (or a non-split RAR) can be used as an entry point for extraction.
-    """
-    # New-style: file.part2.rar, file.part3.rar, …
-    m = _re.search(r"\.part(\d+)\.rar$", src.name, _re.IGNORECASE)
-    if m and int(m.group(1)) > 1:
-        raise RuntimeError(
-            f"'{src.name}' is a multi-part RAR continuation (part {m.group(1)}). "
-            "Only the first part (.part1.rar) can be extracted; "
-            "subsequent parts must be present in the same folder."
-        )
-    # Old-style: file.r00, file.r01, … are continuation parts — .rar is the first
-    # so nothing to check for old-style; the opener will fail if parts are missing.
-
-
-def _expand_archive(src: Path, out_dir: Path, depth: int = 0) -> list:
-    """
-    Extract a ZIP or RAR archive and convert its contents to PDFs.
+    Extract a zip and convert its contents to PDFs.
 
     Returns a list of merge-part tuples: (label, pdf_path_or_None, children).
-      - Regular file      → (filename, pdf_path, [])
-      - Nested archive    → (archname, None,     [child_parts …])
+      - Regular file  → (filename, pdf_path, [])
+      - Nested zip    → (zipname,  None,     [child_parts …])
 
-    Raises RuntimeError on unreadable / oversized / too-deeply-nested archives,
-    missing unrar binary (RAR only), or if any contained file cannot be converted.
+    Raises RuntimeError on unreadable / oversized / too-deeply-nested zips,
+    or if any contained file cannot be converted.
     """
-    if depth > _ARCHIVE_MAX_DEPTH:
+    if depth > _ZIP_MAX_DEPTH:
         raise RuntimeError(
-            f"Archive nesting exceeds maximum depth ({_ARCHIVE_MAX_DEPTH}): {src.name}"
+            f"Zip nesting exceeds maximum depth ({_ZIP_MAX_DEPTH}): {src.name}"
         )
 
-    ext = src.suffix.lower()
-
-    if ext == ".rar":
-        _check_multipart_rar(src)
-        try:
-            import rarfile
-        except ImportError:
-            raise RuntimeError("rarfile not installed: pip install rarfile")
-        # Point rarfile at the unrar binary (only needs to happen once per process,
-        # but setting it each time is harmless and avoids global-state concerns)
-        rarfile.UNRAR_TOOL = _find_unrar()
-        archive_cls   = rarfile.RarFile
-        bad_exc       = (rarfile.BadRarFile, rarfile.NotRarFile, rarfile.NeedFirstVolume)
-        archive_label = "RAR"
-    else:
-        archive_cls   = zipfile.ZipFile
-        bad_exc       = (zipfile.BadZipFile,)
-        archive_label = "zip"
-
     try:
-        with archive_cls(src) as af:
-            total_bytes = sum(info.file_size for info in af.infolist())
-            if total_bytes > _ARCHIVE_MAX_UNCOMPRESSED:
+        with zipfile.ZipFile(src) as zf:
+            total_bytes = sum(info.file_size for info in zf.infolist())
+            if total_bytes > _ZIP_MAX_UNCOMPRESSED:
                 raise RuntimeError(
-                    f"{archive_label} uncompressed size ({total_bytes // (1024 * 1024)} MB) "
-                    f"exceeds {_ARCHIVE_MAX_UNCOMPRESSED // (1024 * 1024)} MB safety limit: {src.name}"
+                    f"Zip uncompressed size ({total_bytes // (1024 * 1024)} MB) "
+                    f"exceeds {_ZIP_MAX_UNCOMPRESSED // (1024 * 1024)} MB safety limit: {src.name}"
                 )
             extract_dir = out_dir / "extracted"
             extract_dir.mkdir()
-            _safe_extractall(af, extract_dir)
-    except bad_exc as exc:
-        raise RuntimeError(f"Cannot read {archive_label} '{src.name}': {exc}")
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"Cannot read zip '{src.name}': {exc}")
 
+    # Walk contents sorted so order is deterministic
     all_files = sorted(f for f in extract_dir.rglob("*") if f.is_file())
     if not all_files:
-        raise RuntimeError(f"'{src.name}' is empty or contains no files")
+        raise RuntimeError(f"Zip '{src.name}' is empty or contains no files")
 
     parts = []
     for idx, item in enumerate(all_files):
-        label    = str(item.relative_to(extract_dir))  # preserves subdir paths
+        label    = str(item.relative_to(extract_dir))   # preserves subdir paths
         item_out = out_dir / f"item_{idx}"
         item_out.mkdir()
 
-        if item.suffix.lower() in ARCHIVE_EXTS:
-            children = _expand_archive(item, item_out, depth + 1)
+        if item.suffix.lower() in ZIP_EXTS:
+            children = _expand_zip(item, item_out, depth + 1)
             parts.append((label, None, children))
         else:
             pdf = convert_to_pdf(item, item_out)
@@ -541,30 +488,87 @@ def merge_pdfs(parts: list, output_path: Path) -> None:
 # Per-folder processing
 # ---------------------------------------------------------------------------
 
-def _find_email_folders(output_dir: Path) -> list:
-    """Return all subdirectories that contain an email PDF ({dir}/{dir}.pdf)."""
-    return sorted(
-        d for d in output_dir.rglob("*")
-        if d.is_dir() and (d / f"{d.name}.pdf").exists()
+METADATA_NAME = "metadata.json"
+
+
+def _email_pdf_for(folder: Path, filenames: list):
+    """
+    Decide whether folder is an email folder.
+
+    Returns (email_pdf_path, error_message):
+      (Path, None)  -> email folder; Path is the email body PDF
+      (None, str)   -> looks like an email folder (has metadata.json) but the
+                       email PDF cannot be identified
+      (None, None)  -> not an email folder; keep walking
+    """
+    names_lower = {n.lower(): n for n in filenames}
+
+    own_pdf = names_lower.get(f"{folder.name}.pdf".lower())
+    if own_pdf:
+        return folder / own_pdf, None
+
+    if METADATA_NAME not in names_lower:
+        return None, None
+
+    pdfs = sorted(n for n in filenames if n.lower().endswith(".pdf"))
+    if len(pdfs) == 1:
+        return folder / pdfs[0], None
+    if not pdfs:
+        return None, "has metadata.json but no email PDF"
+    return None, (
+        f"has metadata.json and {len(pdfs)} PDFs, none named "
+        f"'{folder.name}.pdf'; cannot tell which is the email"
     )
+
+
+def _find_email_folders(source_dir: Path, exclude: Path, errors: list) -> list:
+    """
+    Walk source_dir recursively and return [(email_folder, email_pdf), ...].
+
+    Descent stops at each email folder, so its attachments/ subfolder (or
+    anything else inside it) is never treated as a separate email.
+    The exclude directory (the _combined output tree) is never walked.
+    """
+    found = []
+    for root, dirs, files in os.walk(source_dir):
+        root_path = Path(root)
+        dirs.sort()
+
+        # Never walk into the output tree if it sits inside the source
+        dirs[:] = [d for d in dirs if (root_path / d).resolve() != exclude]
+
+        if root_path == source_dir:
+            continue  # the top-level folder itself is not an email
+
+        email_pdf, problem = _email_pdf_for(root_path, files)
+        if email_pdf is not None:
+            found.append((root_path, email_pdf))
+            dirs[:] = []          # stop here: this is the email level
+        elif problem:
+            rel = root_path.relative_to(source_dir)
+            errors.append(f"[{rel}] Skipped: {problem}")
+            print(f"[SKIP]   {rel}: {problem}")
+            dirs[:] = []
+    return found
 
 
 def process_email_folder(
     email_folder: Path,
-    combined_dir: Path,
+    email_pdf: Path,
+    out_path: Path,
     errors: list,
+    label: str,
 ) -> bool:
     """
-    Produce a combined PDF for one email folder.
+    Produce a combined PDF for one email folder at out_path.
     Returns True on success, False if any conversion failed (error appended to errors).
     """
-    email_pdf      = email_folder / f"{email_folder.name}.pdf"
     attachments_dir = email_folder / "attachments"
     attachments    = sorted(
         f for f in attachments_dir.iterdir() if f.is_file()
     ) if attachments_dir.exists() else []
 
-    out_path = combined_dir / f"{email_folder.name}.pdf"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # No attachments — copy the email PDF directly
     if not attachments:
@@ -581,8 +585,8 @@ def process_email_folder(
             att_tmp = tmp_dir / f"att_{i}"
             att_tmp.mkdir()
             try:
-                if att.suffix.lower() in ARCHIVE_EXTS:
-                    children = _expand_archive(att, att_tmp)
+                if att.suffix.lower() in ZIP_EXTS:
+                    children = _expand_zip(att, att_tmp)
                     parts.append((att.name, None, children))
                     n_files = sum(1 for _, p, _ in children if p is not None)
                     print(f"  [OK]     {att.name}  ({n_files} file(s) inside)")
@@ -592,7 +596,7 @@ def process_email_folder(
                     print(f"  [OK]     {att.name}")
             except Exception as exc:
                 msg = (
-                    f"[{email_folder.name}] "
+                    f"[{label}] "
                     f"Failed to convert '{att.name}': {exc}"
                 )
                 errors.append(msg)
@@ -611,50 +615,60 @@ def process_email_folder(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        output_dir = Path(sys.argv[1]).resolve()
-    else:
-        output_dir = Path(__file__).parent / "output"
+    if len(sys.argv) != 2:
+        print("Usage: python merge_email.py <folder name>", file=sys.stderr)
+        sys.exit(2)
 
-    if not output_dir.exists() or not output_dir.is_dir():
-        print(f"Error: directory not found: {output_dir}", file=sys.stderr)
+    source_dir = Path(sys.argv[1]).expanduser().resolve()
+    if not source_dir.is_dir():
+        print(f"Error: directory not found: {source_dir}", file=sys.stderr)
         sys.exit(1)
 
-    combined_dir = output_dir.parent / f"{output_dir.name}_combined"
+    combined_dir = source_dir.parent / f"{source_dir.name}_combined"
     combined_dir.mkdir(parents=True, exist_ok=True)
     errors_txt = combined_dir / "errors.txt"
 
-    print(f"Source : {output_dir}")
+    print(f"Source : {source_dir}")
     print(f"Dest   : {combined_dir}")
     print()
 
-    folders = _find_email_folders(output_dir)
+    errors  = []
+    folders = _find_email_folders(source_dir, combined_dir.resolve(), errors)
+    skipped = len(errors)
+
     if not folders:
         print("No email folders found.")
-        return
 
-    errors    = []
     succeeded = 0
     failed    = 0
 
-    for folder in folders:
-        print(f"[{folder.name}]")
-        ok = process_email_folder(folder, combined_dir, errors)
+    for folder, email_pdf in folders:
+        rel      = folder.relative_to(source_dir)
+        # Mirror the source structure: <parent subfolders>/<email folder name>.pdf
+        out_path = combined_dir / rel.parent / f"{folder.name}.pdf"
+        print(f"[{rel}]")
+        try:
+            ok = process_email_folder(folder, email_pdf, out_path, errors, str(rel))
+        except Exception as exc:
+            errors.append(f"[{rel}] Unexpected error: {exc}")
+            print(f"  [ERROR]  {exc}")
+            ok = False
         if ok:
             succeeded += 1
         else:
             failed += 1
         print()
 
-    print(f"Done: {succeeded} merged, {failed} failed.")
+    print(f"Done: {succeeded} merged, {failed} failed, {skipped} skipped.")
 
     if errors:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(errors_txt, "a", encoding="utf-8") as f:
             f.write(f"\n=== {timestamp} ===\n")
+            f.write(f"Source: {source_dir}\n")
             for msg in errors:
                 f.write(f"{msg}\n")
-        print(f"\n{failed} error(s) logged to: {errors_txt}")
+        print(f"\n{len(errors)} issue(s) logged to: {errors_txt}")
 
 
 if __name__ == "__main__":
